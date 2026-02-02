@@ -1,87 +1,104 @@
 import streamlit as st
 import base64
-import os
 import requests
-from io import BytesIO
 from mistralai import Mistral
 
 # --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(
-    page_title="OCR MAnuscript",
+    page_title="Mistral OCR 3 - Manuscriptor",
     page_icon="📜",
     layout="wide"
 )
 
-# --- PROMPT DI SISTEMA (Preso dallo script originale) ---
+# --- PROMPT DI SISTEMA ---
 SYSTEM_PROMPT = """
 Sei un esperto paleografo e filologo specializzato in manoscritti antichi.
 Il tuo compito è analizzare il testo OCR fornito, che potrebbe contenere errori di lettura o caratteri arcaici.
 
 Esegui le seguenti operazioni:
-1. Correggi evidenti errori di scansione (es. caratteri senza senso dovuti a macchie).
-2. Mantieni la struttura dei paragrafi e delle righe ove sensato.
+1. Correggi evidenti errori di scansione o di encoding.
+2. Mantieni rigorosamente la struttura dei paragrafi e la divisione delle pagine se indicata.
 3. Se il testo è in italiano antico o latino, correggi solo la punteggiatura e normalizza le 'u'/'v' e le 'i'/'j' secondo l'uso moderno, ma NON tradurre o modernizzare le parole se non richiesto.
-4. Restituisci SOLO il testo pulito, senza preamboli o commenti.
+4. Restituisci SOLO il testo pulito.
 """
 
 # --- FUNZIONI DI SUPPORTO ---
 
-def encode_image_from_bytes(image_bytes, mime_type="image/jpeg"):
+def encode_file_to_base64(file_bytes, mime_type):
     """
-    Codifica i byte dell'immagine in base64 per l'API Mistral.
-    Adattato da encode_image dello script originale.
+    Codifica i byte del file (immagine o PDF) in base64 per l'API Mistral.
     """
     try:
-        encoded_string = base64.b64encode(image_bytes).decode('utf-8')
+        encoded_string = base64.b64encode(file_bytes).decode('utf-8')
         return f"data:{mime_type};base64,{encoded_string}"
     except Exception as e:
-        st.error(f"Errore encoding immagine: {e}")
+        st.error(f"Errore encoding file: {e}")
         return None
 
-def get_image_from_url(url):
-    """Scarica un'immagine da un URL e restituisce byte e mime_type."""
+def get_file_from_url(url):
+    """Scarica un file da un URL e restituisce byte e mime_type."""
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        content_type = response.headers.get('content-type', 'image/jpeg')
+        content_type = response.headers.get('content-type', 'application/pdf') # Default to pdf if unknown
+        # Correzione comune per header imprecisi
+        if url.lower().endswith('.pdf'):
+            content_type = 'application/pdf'
+        elif url.lower().endswith(('.jpg', '.jpeg')):
+            content_type = 'image/jpeg'
+        elif url.lower().endswith('.png'):
+            content_type = 'image/png'
+            
         return response.content, content_type
     except Exception as e:
-        st.error(f"Errore nel scaricare l'immagine dall'URL: {e}")
+        st.error(f"Errore nel scaricare il file dall'URL: {e}")
         return None, None
 
-def process_single_image(client, image_base64, model_ocr, model_chat):
+def process_document(client, file_base64, model_ocr, model_chat):
     """
-    Esegue la pipeline OCR + Normalizzazione su una singola immagine.
-    Logica derivata da process_manuscripts.
+    Esegue OCR su documenti multipagina (PDF) o immagini singole.
     """
     results = {}
     
-    # 1. OCR
+    # 1. OCR (Mistral OCR 3 supporta nativamente i PDF via base64)
     try:
         ocr_response = client.ocr.process(
             model=model_ocr,
             document={
-                "type": "image_url",
-                "image_url": image_base64
+                "type": "image_url", # Nota: l'API usa 'image_url' anche per i data URL dei PDF
+                "image_url": file_base64
             },
             include_image_base64=False
         )
-        if ocr_response.pages:
-            results['raw_ocr'] = ocr_response.pages[0].markdown
+        
+        full_markdown = ""
+        page_count = len(ocr_response.pages)
+        
+        if page_count > 0:
+            # Iteriamo su tutte le pagine del PDF/Immagine
+            for i, page in enumerate(ocr_response.pages):
+                header = f"\n\n--- Pagina {i+1} ---\n\n"
+                full_markdown += header + page.markdown
+            
+            results['raw_ocr'] = full_markdown
+            results['pages_count'] = page_count
         else:
-            results['error'] = "L'OCR non ha rilevato testo."
+            results['error'] = "L'OCR ha completato l'analisi ma non ha rilevato testo."
             return results
+
     except Exception as e:
         results['error'] = f"Errore API OCR: {str(e)}"
         return results
 
     # 2. Normalizzazione
+    # Nota: Se il PDF è enorme (es. 100+ pagine), potresti voler normalizzare pagina per pagina
+    # per evitare limiti di contesto. Qui assumiamo manoscritti di lunghezza ragionevole.
     try:
         chat_response = client.chat.complete(
             model=model_chat,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Ecco il testo grezzo da normalizzare:\n\n{results['raw_ocr']}"}
+                {"role": "user", "content": f"Ecco la trascrizione grezza (composta da {results.get('pages_count', 1)} pagine):\n\n{results['raw_ocr']}"}
             ]
         )
         results['normalized'] = chat_response.choices[0].message.content
@@ -95,45 +112,44 @@ with st.sidebar:
     st.header("⚙️ Configurazione")
     api_key_input = st.text_input("Inserisci Mistral API Key", type="password", help="La tua chiave non viene salvata.")
     
-    st.info("I modelli utilizzati sono:\n- OCR: `mistral-ocr-latest`\n- Chat: `mistral-large-latest`")
+    st.info("Modelli attivi:\n- OCR Engine: `mistral-ocr-latest` (OCR 3)\n- Normalizer: `mistral-large-latest`")
     
     if st.button("Pulisci Sessione"):
         st.session_state.results = {}
         st.rerun()
 
 # --- INTERFACCIA UTENTE (MAIN) ---
-st.title("📜 Mistral Ancient Manuscript OCR")
-st.markdown("Carica immagini di manoscritti antichi per ottenere trascrizione e normalizzazione filologica.")
+st.title("OCR 3 - Trascrizione testi tramite modelli Mistral")
+st.markdown("Carica immagini o **PDF completi** di manoscritti antichi per trascrizione e normalizzazione.")
 
-# Gestione dello stato per memorizzare i risultati
 if 'results' not in st.session_state:
     st.session_state.results = {}
 
-# Tabs per scegliere il metodo di input
-tab1, tab2 = st.tabs(["📤 Carica File", "wf URL Immagine"])
+tab1, tab2 = st.tabs(["📤 Carica File (Img/PDF)", "🌐 URL File"])
 
 input_data = [] # Lista di tuple (nome, byte, mime_type)
 
 with tab1:
-    uploaded_files = st.file_uploader("Trascina qui le immagini (JPG, PNG)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+    # Aggiunto 'pdf' ai tipi supportati
+    uploaded_files = st.file_uploader("Trascina qui i file", type=['png', 'jpg', 'jpeg', 'pdf'], accept_multiple_files=True)
     if uploaded_files:
         for uploaded_file in uploaded_files:
             input_data.append((uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type))
 
 with tab2:
-    url_input = st.text_input("Incolla qui l'URL dell'immagine")
+    url_input = st.text_input("Incolla qui l'URL (Immagine o PDF)")
     if url_input:
-        img_bytes, mime = get_image_from_url(url_input)
-        if img_bytes:
-            input_data.append(("Immagine da URL", img_bytes, mime))
-            st.image(img_bytes, caption="Anteprima URL", width=200)
+        file_bytes, mime = get_file_from_url(url_input)
+        if file_bytes:
+            name_from_url = url_input.split("/")[-1] or "documento_web"
+            input_data.append((name_from_url, file_bytes, mime))
+            st.success(f"File scaricato: {mime} ({len(file_bytes)/1024:.1f} KB)")
 
-# Bottone di avvio
-start_processing = st.button("🚀 Avvia Analisi", type="primary", disabled=(not input_data))
+start_processing = st.button("🚀 Avvia Analisi OCR 3", type="primary", disabled=(not input_data))
 
 if start_processing:
     if not api_key_input:
-        st.error("Per favore inserisci la tua API Key nella barra laterale.")
+        st.error("Chiave API mancante nella barra laterale.")
     else:
         client = Mistral(api_key=api_key_input)
         progress_bar = st.progress(0)
@@ -141,20 +157,20 @@ if start_processing:
         
         total_files = len(input_data)
         
-        for idx, (name, img_bytes, mime) in enumerate(input_data):
-            status_text.text(f"Elaborazione di: {name}...")
+        for idx, (name, file_bytes, mime) in enumerate(input_data):
+            status_text.text(f"Elaborazione OCR 3 su: {name}...")
             
-            # Encoding
-            base64_img = encode_image_from_bytes(img_bytes, mime)
+            # Gestione Mime Type corretta per PDF
+            if mime == "application/pdf":
+                base64_file = encode_file_to_base64(file_bytes, "application/pdf")
+            else:
+                # Fallback per immagini (o se il mime non è rilevato correttamente)
+                base64_file = encode_file_to_base64(file_bytes, mime if mime else "image/jpeg")
             
-            if base64_img:
-                # Processamento
-                res = process_single_image(client, base64_img, "mistral-ocr-latest", "mistral-large-latest")
-                
-                # Salvataggio in session state
+            if base64_file:
+                res = process_document(client, base64_file, "mistral-ocr-latest", "mistral-large-latest")
                 st.session_state.results[name] = res
             
-            # Aggiorna barra progresso
             progress_bar.progress((idx + 1) / total_files)
         
         status_text.text("✅ Elaborazione completata!")
@@ -165,7 +181,7 @@ if st.session_state.results:
     st.subheader("Risultati")
 
     for filename, data in st.session_state.results.items():
-        with st.expander(f"📄 {filename}", expanded=True):
+        with st.expander(f"📄 {filename} ({data.get('pages_count', 0)} pagine)", expanded=True):
             if 'error' in data:
                 st.error(data['error'])
                 continue
@@ -173,21 +189,21 @@ if st.session_state.results:
             col1, col2 = st.columns(2)
             
             with col1:
-                st.markdown("### 👁️ OCR Grezzo")
-                st.text_area("Testo rilevato", value=data.get('raw_ocr', ''), height=300, key=f"raw_{filename}")
+                st.markdown("### 👁️ OCR Grezzo (Unito)")
+                st.text_area("Markdown OCR", value=data.get('raw_ocr', ''), height=400, key=f"raw_{filename}")
                 st.download_button(
-                    label="⬇️ Scarica OCR MD",
+                    label="⬇️ Scarica OCR Completo",
                     data=data.get('raw_ocr', ''),
-                    file_name=f"{filename}_ocr.md",
+                    file_name=f"{filename}_ocr_full.md",
                     mime="text/markdown"
                 )
 
             with col2:
-                st.markdown("### 🧠 Normalizzato")
-                st.text_area("Testo corretto", value=data.get('normalized', ''), height=300, key=f"norm_{filename}")
+                st.markdown("### 🧠 Normalizzazione")
+                st.text_area("Testo Normalizzato", value=data.get('normalized', ''), height=400, key=f"norm_{filename}")
                 st.download_button(
-                    label="⬇️ Scarica Norm MD",
+                    label="⬇️ Scarica Norm. Completa",
                     data=data.get('normalized', ''),
-                    file_name=f"{filename}_norm.md",
+                    file_name=f"{filename}_norm_full.md",
                     mime="text/markdown"
                 )
